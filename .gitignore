@@ -1,0 +1,33 @@
+.venv/
+__pycache__/
+*.pyc
+*.pth
+data/
+outputs/
+
+# Virtual environments
+.venv/
+.venv_legacy/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model checkpoints and data
+*.pth
+data/
+outputs/
+
+# Temporary files
+*.tmp
+
+# External dependency repositories
+hls-foundation-os/
+mmsegmentation/
+
+# Local test packages
+wheel_test/
+
+# Editor settings
+.vscode/

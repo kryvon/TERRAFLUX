@@ -1,0 +1,118 @@
+﻿AI_EARTH_GUARDIAN - PROJECT STATUS
+Generated: 10/29/2026 11:03:06
+Project path: C:\projects\AI_EARTH_GUARDIAN
+
+=== PROJECT ROOT CHECK ===
+FOUND | hls-foundation-os\model_inference.py | 0.01 MB | Modified: 10/28/2026 19:55:15
+FOUND | hls-foundation-os\configs\sen1floods11_config.py | 0.01 MB | Modified: 10/26/2026 01:33:40
+FOUND | sen1floods11_Prithvi_100M.pth | 1143.02 MB | Modified: 10/26/2026 19:38:12
+FOUND | data\Sen1Floods11-master\sample\Labels\Spain_7370579_LabelHand.tif | 0.01 MB | Modified: 10/25/2026 23:49:34
+FOUND | data\sentinel2_selected_bands_corrected.tif | 1.41 MB | Modified: 10/28/2026 21:37:09
+FOUND | outputs\inference_input\sentinel2_selected_bands_pred.tif | 0.02 MB | Modified: 10/28/2026 21:38:57
+FOUND | outputs\inference_input\sentinel2_selected_bands_old_pred.tif | 0.02 MB | Modified: 10/28/2026 19:58:32
+FOUND | outputs\flood_mask_comparison_corrected.png | 0.3 MB | Modified: 10/28/2026 22:17:02
+
+=== PYTHON ENVIRONMENT ===
+Python: C:\projects\AI_EARTH_GUARDIAN\.venv\Scripts\python.exe
+Version: 3.11.9
+WARNING: Package(s) not found: geospatial-fm, mmsegmentation
+Name: torch
+Version: 2.14.1
+Summary: Tensors and Dynamic neural networks in Python with strong GPU acceleration
+Home-page: https://pytorch.org
+Author: 
+Author-email: PyTorch Team <packages@pytorch.org>
+License-Expression: Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT
+Location: C:\projects\AI_EARTH_GUARDIAN\.venv\Lib\site-packages
+Requires: filelock, fsspec, jinja2, networkx, setuptools, sympy, typing-extensions
+Required-by: kornia, lightly, lightning, pytorch-lightning, segmentation_models_pytorch, terratorch, timm, torchgeo, torchmetrics, torchvision
+---
+Name: rasterio
+Version: 1.4.4
+Summary: Fast and direct raster I/O for use with Numpy and SciPy
+Home-page: https://github.com/rasterio/rasterio
+Author: Sean Gillies
+Author-email: sean@mapbox.com
+License: BSD
+Location: C:\projects\AI_EARTH_GUARDIAN\.venv\Lib\site-packages
+Requires: affine, attrs, certifi, click, click-plugins, cligj, numpy, pyparsing
+Required-by: rioxarray, terratorch, torchgeo
+
+=== VALIDATION FOLDER STATUS ===
+data\validation\S2_raw : NOT CREATED
+data\validation\labels : NOT CREATED
+data\validation\inference_input : NOT CREATED
+
+=== RECENT PROJECT FILES ===
+10/28/2026 22:42:06 | data\validation5\input\Ghana_319168_S2Hand.tif
+10/28/2026 22:42:05 | data\validation5\labels\Ghana_319168_LabelHand.tif
+10/28/2026 22:42:05 | data\validation5\raw_s2\Ghana_319168_S2Hand.tif
+10/28/2026 22:42:00 | data\validation5\input\Ghana_359826_S2Hand.tif
+10/28/2026 22:41:59 | data\validation5\labels\Ghana_359826_LabelHand.tif
+10/28/2026 22:41:59 | data\validation5\raw_s2\Ghana_359826_S2Hand.tif
+10/28/2026 22:41:56 | data\validation5\input\Ghana_97059_S2Hand.tif
+10/28/2026 22:41:56 | data\validation5\labels\Ghana_97059_LabelHand.tif
+10/28/2026 22:41:54 | data\validation5\raw_s2\Ghana_97059_S2Hand.tif
+10/28/2026 22:41:50 | data\validation5\input\Ghana_1078550_S2Hand.tif
+10/28/2026 22:41:49 | data\validation5\labels\Ghana_1078550_LabelHand.tif
+10/28/2026 22:41:49 | data\validation5\raw_s2\Ghana_1078550_S2Hand.tif
+10/28/2026 22:41:46 | data\validation5\input\Ghana_313799_S2Hand.tif
+10/28/2026 22:41:45 | data\validation5\labels\Ghana_313799_LabelHand.tif
+10/28/2026 22:41:43 | data\validation5\raw_s2\Ghana_313799_S2Hand.tif
+10/28/2026 22:17:02 | outputs\flood_mask_comparison_corrected.png
+10/28/2026 21:38:57 | outputs\inference_input\sentinel2_selected_bands_pred.tif
+10/28/2026 21:37:09 | data\inference_input\sentinel2_selected_bands.tif
+10/28/2026 21:37:09 | data\sentinel2_selected_bands_corrected.tif
+10/28/2026 20:55:53 | AI_EARTH_GUARDIAN.code-workspace
+10/28/2026 20:00:49 | outputs\flood_mask_comparison.png
+10/28/2026 19:58:32 | outputs\inference_input\sentinel2_selected_bands_old_pred.tif
+10/27/2026 22:37:54 | .gitignore
+10/27/2026 22:36:01 | requirements-current.txt
+10/27/2026 22:32:11 | model_inference.py
+
+=== RECENT RELEVANT TERMINAL COMMANDS ===
+History file: C:\Users\a\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt
+Copy-Item .\outputs\inference_input\sentinel2_selected_bands_pred.tif ``
+  .\outputs\inference_input\sentinel2_selected_bands_old_pred.tif -Force`
+Copy-Item .\data\sentinel2_selected_bands_corrected.tif ``
+  .\data\inference_input\sentinel2_selected_bands.tif -Force`
+python .\hls-foundation-os\model_inference.py ``
+  -config .\hls-foundation-os\configs\sen1floods11_config.py ``
+  -input "$root/data/inference_input" ``
+    "OLD prediction": "outputs/inference_input/sentinel2_selected_bands_old_pred.tif",`
+    "NEW prediction": "outputs/inference_input/sentinel2_selected_bands_pred.tif",`
+    "INPUT": "data/inference_input/sentinel2_selected_bands.tif",`
+    "NEW PREDICTION": "outputs/inference_input/sentinel2_selected_bands_pred.tif",`
+    "OLD prediction": "outputs/inference_input/sentinel2_selected_bands_old_pred.tif",`
+    "NEW prediction": "outputs/inference_input/sentinel2_selected_bands_pred.tif",`
+    "OLD": "outputs/inference_input/sentinel2_selected_bands_old_pred.tif",`
+    "NEW": "outputs/inference_input/sentinel2_selected_bands_pred.tif",`
+pred_path = "outputs/inference_input/sentinel2_selected_bands_pred.tif"`
+out_path = "outputs/flood_mask_comparison_corrected.png"`
+Select-String -Path .\hls-foundation-os\configs\sen1floods11_config.py ``
+Get-ChildItem . -Recurse -File -Filter "test_split.txt" |`
+Get-ChildItem . -Recurse -File -Filter "test_split.txt" |`
+    "hls-foundation-os\model_inference.py",`
+    "hls-foundation-os\configs\sen1floods11_config.py",`
+    "data\sentinel2_selected_bands_corrected.tif",`
+    "outputs\inference_input\sentinel2_selected_bands_pred.tif",`
+    "outputs\inference_input\sentinel2_selected_bands_old_pred.tif",`
+    "outputs\flood_mask_comparison_corrected.png"`
+    "data\validation\S2_raw",`
+    "data\validation\labels",`
+    "data\validation\inference_input"`
+            Select-String -Pattern "model_inference|sentinel2_selected|geospatial_fm|flood_mask|test_split|data\\validation|sen1floods11_config|pip install|ConstantMultiply|inference" |`
+
+=== GIT STATUS ===
+?? .gitignore
+?? .venv_legacy/
+?? .vscode/
+?? AI_EARTH_GUARDIAN.code-workspace
+?? flood_config.yaml
+?? hls-foundation-os/
+?? mmsegmentation/
+?? model_inference.py
+?? requirements-current.txt
+?? sen1floods11_Prithvi_100M.py
+?? src/
+?? wheel_test/
