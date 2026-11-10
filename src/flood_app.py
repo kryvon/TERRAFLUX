@@ -1,4 +1,3 @@
-
 from pathlib import Path
 import sys
 import threading
@@ -11,12 +10,6 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import rasterio
-import torch
-
-from mmcv import Config
-from mmcv.parallel import collate
-from mmseg.apis import init_segmentor
-from mmseg.datasets.pipelines import Compose
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -79,11 +72,16 @@ def find_checkpoint():
 def make_rgb(path):
     with rasterio.open(path) as src:
         if src.count == 13:
-            bands = src.read([4, 3, 2]).astype(np.float32)
+            rgb_indexes = [4, 3, 2]
         elif src.count == 6:
-            bands = src.read([3, 2, 1]).astype(np.float32)
+            rgb_indexes = [3, 2, 1]
         else:
             raise ValueError("Expected a 6-band or 13-band image.")
+        bands = src.read(rgb_indexes).astype(np.float32)
+        rgb_valid = np.all(src.read_masks(rgb_indexes) > 0, axis=0)
+        if src.nodata is not None:
+            rgb_valid &= np.all(bands != src.nodata, axis=0)
+        rgb_valid &= np.all(np.isfinite(bands), axis=0)
 
     rgb = np.zeros(
         (bands.shape[1], bands.shape[2], 3),
@@ -92,7 +90,7 @@ def make_rgb(path):
 
     for i in range(3):
         band = bands[i]
-        finite = np.isfinite(band)
+        finite = np.isfinite(band) & rgb_valid
 
         if not finite.any():
             continue
@@ -108,6 +106,7 @@ def make_rgb(path):
             1
         )
 
+    rgb[~rgb_valid] = 0.0
     return rgb
 
 
@@ -170,16 +169,22 @@ class FloodApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("AI Earth Guardian | Flood Intelligence")
-        self.root.geometry("1450x950")
-        self.root.minsize(1050, 760)
+        self.root.title("TERRAFLUX | Satellite Flood Intelligence")
+        self.root.geometry("1440x900")
+        self.root.minsize(1280, 760)
         self.root.configure(bg=BG)
 
         self.model = None
         self.pipeline = None
+        self.torch = None
+        self.collate_fn = None
 
         self.input_path = None
         self.rgb = None
+        self._raster_transform = None
+        self._raster_crs = None
+        self._coordinate_transformer = None
+        self._row_area_cache = None
         self.probability = None
         self.valid_mask = None
         self.flood_map = None
@@ -194,12 +199,21 @@ class FloodApp:
         self.drag_data = None
         self.axes = []
         self.map_axes = None
+        self.view_limits = {}
+        self.overlay_opacity = tk.DoubleVar(value=0.55)
 
         self.pending_scroll = 0
         self.scroll_after_id = None
+        self.figures = {}
+        self.canvases = {}
+        self.axes_by_key = {}
+        self.map_widgets = {}
+        self.map_cards = {}
+        self.map_axes = None
 
         self.build_ui()
         self.load_demo_image()
+        self.root.after_idle(lambda: self.page.yview_moveto(0))
 
         self.root.after(80, self.process_ui_queue)
 
@@ -245,6 +259,7 @@ class FloodApp:
             orient="vertical",
             command=self.page.yview
         )
+        # Keep the scrollbar visible: the dashboard is intentionally scrollable.
         self.scrollbar.pack(side="right", fill="y")
 
         self.page.configure(
@@ -274,36 +289,22 @@ class FloodApp:
             self.resize_page_content
         )
 
-        self.root.bind_all(
-            "<MouseWheel>",
-            self.route_mousewheel,
-            add="+"
-        )
-
-        self.root.bind_all(
-            "<Button-4>",
-            self.route_mousewheel_linux,
-            add="+"
-        )
-
-        self.root.bind_all(
-            "<Button-5>",
-            self.route_mousewheel_linux,
-            add="+"
-        )
+        # Scroll the page everywhere except over a Matplotlib map, where the
+        # same wheel event is reserved for zooming that specific map axis.
+        self.root.bind_all("<MouseWheel>", self.route_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self.route_mousewheel_linux, add="+")
+        self.root.bind_all("<Button-5>", self.route_mousewheel_linux, add="+")
+        self.root.bind_all("<Prior>", lambda _e: self.page.yview_scroll(-1, "pages"), add="+")
+        self.root.bind_all("<Next>", lambda _e: self.page.yview_scroll(1, "pages"), add="+")
 
         self.build_dashboard()
 
     def update_scroll_region(self, _event=None):
-        self.page.configure(
-            scrollregion=self.page.bbox("all")
-        )
+        self.page.configure(scrollregion=self.page.bbox("all"))
 
     def resize_page_content(self, event):
-        self.page.itemconfigure(
-            self.window_id,
-            width=event.width
-        )
+        self.page.itemconfigure(self.window_id, width=event.width)
+        self.page.after_idle(self.update_scroll_region)
 
     def is_widget_inside(self, widget, parent):
         while widget is not None:
@@ -314,42 +315,38 @@ class FloodApp:
 
         return False
 
+    def pointer_over_map_axes(self, event):
+        for key, widget in getattr(self, "map_widgets", {}).items():
+            if not widget.winfo_exists(): continue
+            lx = event.x_root - widget.winfo_rootx()
+            ly = widget.winfo_height() - (event.y_root - widget.winfo_rooty())
+            if lx < 0 or ly < 0 or lx > widget.winfo_width() or ly > widget.winfo_height():
+                continue
+            ax = self.axes_by_key.get(key)
+            if ax is not None and ax.bbox.contains(lx, ly):
+                return True
+        return False
+
+
     def route_mousewheel(self, event):
-        widget = self.root.winfo_containing(
-            event.x_root,
-            event.y_root
-        )
-
-        if widget and self.is_widget_inside(
-            widget,
-            self.map_widget
-        ):
-            return "break"
-
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if self.pointer_over_map_axes(event):
+            return None
+        if hasattr(self, "scrollbar") and self.is_widget_inside(widget, self.scrollbar):
+            return None
         steps = int(-event.delta / 120)
-
         if steps == 0:
             steps = -1 if event.delta > 0 else 1
-
         self.queue_page_scroll(steps)
         return "break"
 
     def route_mousewheel_linux(self, event):
-        widget = self.root.winfo_containing(
-            event.x_root,
-            event.y_root
-        )
-
-        if widget and self.is_widget_inside(
-            widget,
-            self.map_widget
-        ):
-            return "break"
-
-        self.queue_page_scroll(
-            -1 if event.num == 4 else 1
-        )
-
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if self.pointer_over_map_axes(event):
+            return None
+        if hasattr(self, "scrollbar") and self.is_widget_inside(widget, self.scrollbar):
+            return None
+        self.queue_page_scroll(-1 if event.num == 4 else 1)
         return "break"
 
     def queue_page_scroll(self, steps):
@@ -366,6 +363,9 @@ class FloodApp:
         self.pending_scroll = 0
         self.scroll_after_id = None
 
+        # Do not clear Matplotlib references here. The maps must remain alive
+        # while the dashboard scrolls; clearing these dictionaries broke map
+        # zoom, pan, redraw and image interaction after the first scroll.
         if steps:
             self.page.yview_scroll(steps, "units")
 
@@ -374,446 +374,237 @@ class FloodApp:
     # ========================================================
 
     def build_dashboard(self):
-        header = tk.Frame(self.outer, bg=BG)
-        header.pack(fill="x", pady=(0, 16))
-
-        tk.Label(
-            header,
-            text="◈  AI EARTH GUARDIAN",
-            bg=BG,
-            fg=TEXT,
-            font=("Segoe UI", 22, "bold")
-        ).pack(side="left")
-
-        tk.Label(
-            header,
-            text="DETECT  •  ANALYZE  •  PROTECT",
-            bg=BG,
-            fg=GOLD,
-            font=("Segoe UI", 10, "bold")
-        ).pack(side="right")
+        # Header remains part of the scrollable page; the dashboard reflows
+        # while preserving the approved TERRAFLUX hierarchy.
+        header = tk.Frame(self.outer, bg=BG, padx=12, pady=8)
+        header.pack(fill="x", pady=(0, 10))
+        brand = tk.Frame(header, bg=BG)
+        brand.pack(side="left", anchor="w")
+        tk.Label(brand, text="◈", bg=BG, fg=GOLD,
+                 font=("Segoe UI Symbol", 34, "bold")).pack(side="left", padx=(0, 14))
+        namebox = tk.Frame(brand, bg=BG)
+        namebox.pack(side="left", anchor="w")
+        title = tk.Frame(namebox, bg=BG)
+        title.pack(anchor="w")
+        tk.Label(title, text="TERRA", bg=BG, fg=TEXT,
+                 font=("Segoe UI", 27, "bold")).pack(side="left")
+        tk.Label(title, text="FLUX", bg=BG, fg=GOLD,
+                 font=("Segoe UI", 27, "bold")).pack(side="left")
+        tk.Label(namebox, text="AI Earth Guardian · Satellite Flood Intelligence",
+                 bg=BG, fg=TEXT, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(header, text="◎  Detect   •   Analyze   •   Protect", bg=BG,
+                 fg=GOLD, font=("Segoe UI", 11, "bold")).pack(side="right", padx=12)
+        tk.Frame(self.outer, bg="#26394A", height=1).pack(fill="x", pady=(0, 12))
 
         body = tk.Frame(self.outer, bg=BG)
         body.pack(fill="both", expand=True)
-
-        body.columnconfigure(0, weight=0, minsize=260)
+        body.columnconfigure(0, weight=0, minsize=292)
         body.columnconfigure(1, weight=1)
-        body.rowconfigure(0, weight=1)
 
-        # LEFT PANEL
-        left = tk.Frame(
-            body,
-            bg=PANEL,
-            padx=15,
-            pady=16,
-            width=260
-        )
-
-        left.grid(
-            row=0,
-            column=0,
-            sticky="nsew",
-            padx=(0, 14)
-        )
-
+        # Mission Control sidebar
+        left = tk.Frame(body, bg=PANEL, padx=15, pady=14, width=292,
+                        highlightbackground="#30465A", highlightthickness=1)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         left.grid_propagate(False)
-
-        tk.Label(
-            left,
-            text="MISSION CONTROL",
-            bg=PANEL,
-            fg=TEXT,
-            font=("Segoe UI", 12, "bold")
-        ).pack(anchor="w")
-
-        tk.Label(
-            left,
-            text="Satellite flood monitoring",
-            bg=PANEL,
-            fg=MUTED
-        ).pack(anchor="w", pady=(4, 16))
-
-        tk.Label(
-            left,
-            text="SATELLITE INPUT",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 8, "bold")
-        ).pack(anchor="w")
-
-        self.file_label = tk.Label(
-            left,
-            text="No image selected",
-            bg=PANEL2,
-            fg=TEXT,
-            justify="left",
-            wraplength=220,
-            padx=9,
-            pady=10
-        )
-
+        tk.Label(left, text="▰  MISSION CONTROL", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        tk.Label(left, text="Satellite flood monitoring", bg=PANEL, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(3, 14))
+        tk.Label(left, text="▣  INPUT SOURCE", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        self.file_label = tk.Label(left, text="No image selected", bg=PANEL2,
+            fg=TEXT, justify="left", wraplength=245, padx=9, pady=9,
+            font=("Segoe UI", 8))
         self.file_label.pack(fill="x", pady=8)
+        ttk.Button(left, text="📁  Choose GeoTIFF", style="Dark.TButton",
+                   command=self.choose_file).pack(fill="x", pady=3)
+        ttk.Button(left, text="▧  Load Demo Image", style="Dark.TButton",
+                   command=self.load_demo_image).pack(fill="x", pady=3)
+        tk.Frame(left, bg="#344454", height=1).pack(fill="x", pady=12)
+        threshold_head = tk.Frame(left, bg=PANEL)
+        threshold_head.pack(fill="x")
+        tk.Label(threshold_head, text="⚙  DETECTION THRESHOLD", bg=PANEL,
+                 fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
+        self.threshold_label = tk.Label(threshold_head, text="30%", bg=PANEL,
+                 fg=GOLD, font=("Segoe UI", 18, "bold"))
+        self.threshold_label.pack(side="right")
+        tk.Scale(left, from_=0.05, to=0.95, resolution=0.05,
+                 orient="horizontal", variable=self.threshold, showvalue=False,
+                 bg=PANEL, fg=TEXT, troughcolor="#536575", activebackground=GOLD,
+                 highlightthickness=0, bd=0, command=self.update_threshold
+                 ).pack(fill="x", pady=(2, 0))
+        tk.Frame(left, bg=PANEL).pack(fill="x")
+        endpoints = tk.Frame(left, bg=PANEL)
+        endpoints.pack(fill="x")
+        tk.Label(endpoints, text="5%", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 8, "bold")).pack(side="left")
+        tk.Label(endpoints, text="95%", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 8, "bold")).pack(side="right")
+        tk.Label(left, text="Higher threshold = stricter detection", bg=PANEL2,
+                 fg=TEXT, font=("Segoe UI", 8), padx=6, pady=4).pack(fill="x", pady=(3, 9))
+        self.run_button = ttk.Button(left, text="▶  RUN ANALYSIS",
+                 style="Gold.TButton", command=self.start_prediction)
+        self.run_button.pack(fill="x", pady=3)
+        self.progress = ttk.Progressbar(left, mode="indeterminate")
+        self.progress.pack(fill="x", pady=7)
+        self.status_label = tk.Label(left, textvariable=self.status, bg=PANEL,
+                 fg="#B9D7C8", justify="left", anchor="w", wraplength=245,
+                 font=("Segoe UI", 8))
+        self.status_label.pack(fill="x", pady=(2, 10))
+        tk.Frame(left, bg="#344454", height=1).pack(fill="x", pady=10)
+        tk.Label(left, text="▣  MODEL INFORMATION", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        tk.Label(left, text="Model: Prithvi 100M\nFramework: MMSegmentation\nDevice: CPU",
+                 bg=PANEL, fg=TEXT, justify="left", font=("Segoe UI", 9)
+                 ).pack(anchor="w", pady=8)
 
-        ttk.Button(
-            left,
-            text="Choose GeoTIFF",
-            style="Dark.TButton",
-            command=self.choose_file
-        ).pack(fill="x", pady=3)
-
-        ttk.Button(
-            left,
-            text="Load Demo Image",
-            style="Dark.TButton",
-            command=self.load_demo_image
-        ).pack(fill="x", pady=3)
-
-        tk.Frame(
-            left,
-            bg="#344454",
-            height=1
-        ).pack(fill="x", pady=14)
-
-        tk.Label(
-            left,
-            text="DETECTION THRESHOLD",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 8, "bold")
-        ).pack(anchor="w")
-
-        self.threshold_label = tk.Label(
-            left,
-            text="30%",
-            bg=PANEL,
-            fg=GOLD,
-            font=("Segoe UI", 20, "bold")
-        )
-
-        self.threshold_label.pack(anchor="w", pady=5)
-
-        tk.Scale(
-            left,
-            from_=0.05,
-            to=0.95,
-            resolution=0.05,
-            orient="horizontal",
-            variable=self.threshold,
-            showvalue=False,
-            bg=PANEL,
-            fg=TEXT,
-            troughcolor="#536575",
-            activebackground=GOLD,
-            highlightthickness=0,
-            command=self.update_threshold
-        ).pack(fill="x", pady=(4, 12))
-
-        self.run_button = ttk.Button(
-            left,
-            text="RUN FLOOD ANALYSIS",
-            style="Gold.TButton",
-            command=self.start_prediction
-        )
-
-        self.run_button.pack(fill="x", pady=5)
-
-        self.progress = ttk.Progressbar(
-            left,
-            mode="indeterminate"
-        )
-
-        self.progress.pack(fill="x", pady=9)
-
-        tk.Label(
-            left,
-            textvariable=self.status,
-            bg=PANEL,
-            fg="#B9D7C8",
-            wraplength=220,
-            justify="left",
-            anchor="w"
-        ).pack(fill="x", anchor="w", pady=5)
-
-        tk.Frame(
-            left,
-            bg="#344454",
-            height=1
-        ).pack(fill="x", pady=13)
-
-        tk.Label(
-            left,
-            text="MODEL INFORMATION",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 8, "bold")
-        ).pack(anchor="w")
-
-        tk.Label(
-            left,
-            text="Prithvi 100M\nSemantic segmentation\nDevice: CPU",
-            bg=PANEL,
-            fg=TEXT,
-            justify="left"
-        ).pack(anchor="w", pady=8)
-
-        # RIGHT PANEL
+        # Main dashboard
         right = tk.Frame(body, bg=BG)
         right.grid(row=0, column=1, sticky="nsew")
-
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
-
-        # METRIC CARDS
         cards = tk.Frame(right, bg=BG)
-        cards.grid(
-            row=0,
-            column=0,
-            sticky="ew",
-            pady=(0, 12)
-        )
-
-        for i in range(3):
-            cards.columnconfigure(i, weight=1)
-
+        cards.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        for i in range(4): cards.columnconfigure(i, weight=1, uniform="metric")
         self.metric_values = []
-
-        titles = [
-            "DETECTED FLOOD PIXELS",
-            "CLASSIFIED PIXEL SHARE",
-            "VALID IMAGE PIXELS"
-        ]
-
-        for i, title in enumerate(titles):
-            card = tk.Frame(
-                cards,
-                bg=PANEL,
-                padx=10,
-                pady=11
-            )
-
-            card.grid(
-                row=0,
-                column=i,
-                sticky="nsew",
-                padx=(0, 7)
-            )
-
-            tk.Label(
-                card,
-                text=title,
-                bg=PANEL,
-                fg=MUTED,
-                font=("Segoe UI", 8, "bold"),
-                wraplength=140,
-                justify="left"
-            ).pack(anchor="w")
-
-            value = tk.Label(
-                card,
-                text="Awaiting analysis",
-                bg=PANEL,
-                fg=TEXT,
-                font=("Segoe UI", 11, "bold")
-            )
-
-            value.pack(anchor="w", pady=(7, 0))
+        metric_titles = ("Flooded Pixels", "Non-Flooded Pixels", "Valid Pixels", "Flooded Share")
+        metric_icons = ("≋", "▲", "●", "◔")
+        for i, (title_text, icon) in enumerate(zip(metric_titles, metric_icons)):
+            card = tk.Frame(cards, bg=PANEL, padx=10, pady=10,
+                            highlightbackground="#30465A", highlightthickness=1)
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 6, 0))
+            tk.Label(card, text=icon, bg=PANEL, fg=("#168BFF", "#29C978", "#8B5CF6", GOLD)[i],
+                     font=("Segoe UI Symbol", 22, "bold")).pack(side="left", padx=(0, 8))
+            textbox = tk.Frame(card, bg=PANEL)
+            textbox.pack(side="left", fill="x", expand=True)
+            tk.Label(textbox, text=title_text, bg=PANEL, fg=MUTED,
+                     font=("Segoe UI", 8), wraplength=125, justify="left").pack(anchor="w")
+            value = tk.Label(textbox, text="—", bg=PANEL, fg=TEXT,
+                     font=("Segoe UI", 12, "bold"))
+            value.pack(anchor="w", pady=(3, 0))
             self.metric_values.append(value)
 
-        # MAP PANEL
-        map_panel = tk.Frame(
-            right,
-            bg=PANEL,
-            padx=12,
-            pady=12
-        )
-
-        map_panel.grid(
-            row=1,
-            column=0,
-            sticky="nsew"
-        )
-
-        map_panel.columnconfigure(0, weight=1)
-        map_panel.rowconfigure(1, weight=1)
-
-        map_header = tk.Frame(map_panel, bg=PANEL)
-
-        map_header.grid(
-            row=0,
-            column=0,
-            sticky="ew",
-            pady=(0, 8)
-        )
-
-        tk.Label(
-            map_header,
-            text="SATELLITE IMAGE ANALYSIS",
-            bg=PANEL,
-            fg=TEXT,
-            font=("Segoe UI", 12, "bold")
-        ).pack(side="left")
-
+        tabs_row = tk.Frame(right, bg=BG)
+        tabs_row.grid(row=1, column=0, sticky="ew", pady=(0, 5))
         self.tab_buttons = {}
+        for mode, label in (("Satellite", "✥  Satellite"), ("Flood", "≋  Flood"),
+                            ("Comparison", "⚖  Comparison")):
+            b = tk.Button(tabs_row, text=label, command=lambda m=mode: self.set_view_mode(m),
+                relief="flat", bd=0, padx=14, pady=9, cursor="hand2",
+                font=("Segoe UI", 9, "bold"), bg=PANEL2, fg=TEXT)
+            b.pack(side="left", expand=True, fill="x", padx=(0, 5))
+            self.tab_buttons[mode] = b
 
-        tabs = tk.Frame(map_header, bg=PANEL)
-        tabs.pack(side="right")
-
-        for mode in ("Satellite", "Flood", "Comparison"):
-            button = tk.Button(
-                tabs,
-                text=mode,
-                command=lambda m=mode: self.set_view_mode(m),
-                relief="flat",
-                bd=0,
-                padx=10,
-                pady=6,
-                font=("Segoe UI", 9, "bold"),
-                cursor="hand2"
+        # Two truly separate map cards, each with its own Figure, axes and controls.
+        maps_row = tk.Frame(right, bg=BG, width=900, height=360)
+        maps_row.grid(row=2, column=0, sticky="nsew")
+        maps_row.grid_propagate(False)
+        maps_row.columnconfigure(0, weight=1, uniform="maps")
+        maps_row.columnconfigure(1, weight=1, uniform="maps")
+        self.map_host = maps_row
+        self.map_cards = {}
+        self.figures = {}
+        self.canvases = {}
+        self.axes_by_key = {}
+        self.map_widgets = {}
+        for col, key, heading, icon in (
+            (0, "satellite", "Original Satellite Image", "▧"),
+            (1, "flood", "Model Flood Detection", "◆")
+        ):
+            card = tk.Frame(maps_row, bg=PANEL, padx=8, pady=8,
+                            highlightbackground="#30465A", highlightthickness=1)
+            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 5 if col == 0 else 0))
+            self.map_cards[key] = card
+            top = tk.Frame(card, bg=PANEL)
+            top.pack(fill="x", pady=(0, 5))
+            tk.Label(top, text=f"{icon}  {heading}", bg=PANEL, fg=TEXT,
+                     font=("Segoe UI", 9, "bold")).pack(side="left")
+            controls = tk.Frame(top, bg=PANEL)
+            controls.pack(side="right")
+            for symbol, factor in (("+", 1.2), ("−", 1/1.2), ("⟳", 0)):
+                ttk.Button(controls, text=symbol, style="Dark.TButton", width=3,
+                    command=lambda k=key, f=factor: self.control_zoom(k, f)
+                    ).pack(side="left", padx=2)
+            fig = Figure(figsize=(5.0, 3.0), dpi=85, facecolor=PANEL)
+            canvas = FigureCanvasTkAgg(fig, master=card)
+            widget = canvas.get_tk_widget()
+            # TkAgg otherwise requests its default 560x420 widget size,
+            # forcing the two-column dashboard wider than the window.
+            widget.configure(width=420, height=300, highlightthickness=0, bg="#0B141D")
+            widget.pack(fill="both", expand=True)
+            ax = fig.add_axes([0.015, 0.025, 0.97, 0.94])
+            self.figures[key], self.canvases[key] = fig, canvas
+            self.axes_by_key[key] = ax
+            self.map_widgets[key] = widget
+            canvas.mpl_connect("scroll_event", self.on_map_scroll)
+            canvas.mpl_connect("button_press_event", self.on_map_press)
+            canvas.mpl_connect("button_release_event", self.on_map_release)
+            canvas.mpl_connect("motion_notify_event", self.on_pan_move)
+            canvas.mpl_connect("motion_notify_event", self.on_map_motion)
+            widget.bind(
+                "<Configure>",
+                lambda _event, c=canvas: c.draw_idle(),
+                add="+"
             )
 
-            button.pack(side="left", padx=2)
-            self.tab_buttons[mode] = button
+        opacity_row = tk.Frame(right, bg=BG)
+        opacity_row.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        tk.Label(opacity_row, text="OVERLAY OPACITY", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(2, 6))
+        self.opacity_label = tk.Label(opacity_row, text="55%", bg=BG, fg=GOLD,
+                 font=("Segoe UI", 8, "bold"))
+        self.opacity_label.pack(side="left")
+        tk.Scale(opacity_row, from_=0.50, to=0.60, resolution=0.01,
+                 orient="horizontal", variable=self.overlay_opacity, showvalue=False,
+                 length=125, bg=BG, fg=TEXT, troughcolor="#536575",
+                 activebackground=GOLD, highlightthickness=0, bd=0,
+                 command=self.update_overlay_opacity).pack(side="left", padx=5)
+        tk.Label(opacity_row, text="Scroll over a map to zoom · Drag to pan · Double-click to reset",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=12)
 
-        self.figure = Figure(
-            figsize=(10, 6),
-            dpi=90,
-            facecolor=PANEL
-        )
+        bottom = tk.Frame(right, bg=BG)
+        bottom.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        bottom.columnconfigure(0, weight=6)
+        bottom.columnconfigure(1, weight=5)
+        insight = tk.Frame(bottom, bg=PANEL, padx=13, pady=11,
+                           highlightbackground="#30465A", highlightthickness=1)
+        insight.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        tk.Label(insight, text="✦  KEY INSIGHTS", bg=PANEL, fg=GOLD,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        self.insights_label = tk.Label(insight,
+            text="Insights will appear after a successful analysis.", bg=PANEL,
+            fg=MUTED, font=("Segoe UI", 8), justify="left", anchor="w")
+        self.insights_label.pack(fill="x", pady=(7, 5))
+        insight_row = tk.Frame(insight, bg=PANEL)
+        insight_row.pack(fill="x", expand=True)
+        for i in range(3):
+            insight_row.columnconfigure(i, weight=1, uniform="insight_columns")
+        self.insight_area_value = tk.Label(insight_row, text="Flooded Area\n—",
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 8, "bold"), justify="left", anchor="w")
+        self.insight_area_value.grid(row=0, column=0, sticky="ew", padx=(0, 7))
+        self.insight_section_value = tk.Label(insight_row, text="Most Affected Section\n—",
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 8, "bold"), justify="left", anchor="w")
+        self.insight_section_value.grid(row=0, column=1, sticky="ew", padx=7)
+        self.insight_share_value = tk.Label(insight_row, text="Flooded Share\n—",
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 8, "bold"), justify="left", anchor="w")
+        self.insight_share_value.grid(row=0, column=2, sticky="ew", padx=(7, 0))
+        exports = tk.Frame(bottom, bg=PANEL, padx=11, pady=11,
+                           highlightbackground="#30465A", highlightthickness=1)
+        exports.grid(row=0, column=1, sticky="nsew")
+        tk.Label(exports, text="⇩  EXPORT OPTIONS", bg=PANEL, fg=GOLD,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 7))
+        buttons = tk.Frame(exports, bg=PANEL)
+        buttons.pack(fill="x")
+        for label, cmd in (("Export PNG", self.export_png), ("Export CSV", self.export_csv),
+                           ("Export GeoTIFF", self.export_geotiff), ("Reset All", self.reset_all)):
+            ttk.Button(buttons, text=label, style="Dark.TButton", command=cmd
+                       ).pack(side="left", padx=(0, 4), fill="x", expand=True)
 
-        self.figure_canvas = FigureCanvasTkAgg(
-            self.figure,
-            master=map_panel
-        )
-
-        self.map_widget = self.figure_canvas.get_tk_widget()
-
-        self.map_widget.grid(
-            row=1,
-            column=0,
-            sticky="nsew"
-        )
-
-        self.figure_canvas.mpl_connect(
-            "scroll_event",
-            self.on_map_scroll
-        )
-
-        self.figure_canvas.mpl_connect(
-            "button_press_event",
-            self.on_map_press
-        )
-
-        self.figure_canvas.mpl_connect(
-            "button_release_event",
-            self.on_map_release
-        )
-
-        self.figure_canvas.mpl_connect(
-            "motion_notify_event",
-            self.on_pan_move
-        )
-
-        footer = tk.Frame(map_panel, bg=PANEL)
-
-        footer.grid(
-            row=2,
-            column=0,
-            sticky="ew",
-            pady=(8, 0)
-        )
-
-        tk.Label(
-            footer,
-            text="Wheel: Zoom  |  Drag: Pan  |  Double-click: Reset",
-            bg=PANEL,
-            fg=MUTED,
-            font=("Segoe UI", 8)
-        ).pack(side="left")
-
-        ttk.Button(
-            footer,
-            text="FIT MAP",
-            style="Dark.TButton",
-            command=self.fit_map
-        ).pack(side="right", padx=2)
-
-        ttk.Button(
-            footer,
-            text="EXPORT PNG",
-            style="Dark.TButton",
-            command=self.export_png
-        ).pack(side="right", padx=2)
-
-        ttk.Button(
-            footer,
-            text="EXPORT CSV",
-            style="Dark.TButton",
-            command=self.export_csv
-        ).pack(side="right", padx=2)
-
-        # EXPLANATION PANEL
-        explanation = tk.Frame(
-            right,
-            bg=PANEL,
-            padx=15,
-            pady=12
-        )
-
-        explanation.grid(
-            row=2,
-            column=0,
-            sticky="ew",
-            pady=(12, 0)
-        )
-
-        tk.Label(
-            explanation,
-            text="UNDERSTAND THIS IMAGE",
-            bg=PANEL,
-            fg=GOLD,
-            font=("Segoe UI", 11, "bold")
-        ).pack(anchor="w")
-
-        self.explanation_text = tk.Label(
-            explanation,
-            text=(
-                "Satellite image: A natural-colour view of Earth's "
-                "surface created from visible satellite bands.\n"
-                "Red overlay: Pixels classified as flood by the model. "
-                "This is a model prediction, not confirmed ground truth.\n"
-                "Important: Normal rivers and lakes may also contain "
-                "water. Water alone does not prove flooding."
-            ),
-            bg=PANEL,
-            fg=TEXT,
-            font=("Segoe UI", 9),
-            justify="left",
-            wraplength=950,
-            anchor="w"
-        )
-
-        self.explanation_text.pack(
-            fill="x",
-            anchor="w",
-            pady=(7, 0)
-        )
-
-        tk.Label(
-            self.outer,
-            text=(
-                "AI Earth Guardian | Model-assisted flood mapping. "
-                "Results require independent validation."
-            ),
-            bg=BG,
-            fg=MUTED,
-            font=("Segoe UI", 8)
-        ).pack(anchor="w", pady=(12, 4))
-
+        tk.Label(self.outer, text="TERRAFLUX  ·  Model-assisted flood mapping. Results require independent validation.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(10, 4))
         self.update_tab_styles()
+        self.draw_results(reset=True)
+        self.root.after_idle(lambda: self.page.yview_moveto(0))
 
-    # ========================================================
-    # INPUT FILES
-    # ========================================================
 
     def load_demo_image(self):
         if not DEMO_IMAGE.exists():
@@ -856,21 +647,39 @@ class FloodApp:
                     f"{Path(path).name}\n"
                     f"{src.width} × {src.height} pixels\n"
                     f"{src.count} bands\n"
-                    f"CRS: {src.crs or 'Not available'}"
+                    f"CRS: {src.crs or 'Not available'}\n"
+                    f"Resolution: {src.res}\n"
+                    f"Bounds: {tuple(round(v, 5) for v in src.bounds)}"
                 )
+                raster_transform = src.transform
+                raster_crs = src.crs
 
             rgb = make_rgb(path)
 
             self.input_path = path
             self.rgb = rgb
+            self._raster_transform = raster_transform
+            self._raster_crs = raster_crs
+            self._row_area_cache = None
+            self._coordinate_transformer = None
+            if raster_crs is not None:
+                try:
+                    from pyproj import Transformer
+                    self._coordinate_transformer = Transformer.from_crs(
+                        raster_crs, "EPSG:4326", always_xy=True
+                    )
+                except Exception:
+                    self._coordinate_transformer = None
             self.probability = None
             self.valid_mask = None
             self.flood_map = None
+            self.view_limits.clear()
+            self.clear_insights()
 
             self.file_label.config(text=details)
 
             for metric in self.metric_values:
-                metric.config(text="Awaiting analysis")
+                metric.config(text="—")
 
             self.view_mode.set("Comparison")
             self.update_tab_styles()
@@ -890,6 +699,18 @@ class FloodApp:
     def load_model(self):
         if self.model is not None:
             return
+
+        try:
+            import torch
+            from mmcv import Config
+            from mmcv.parallel import collate
+            from mmseg.apis import init_segmentor
+            from mmseg.datasets.pipelines import Compose
+        except ImportError as exc:
+            raise RuntimeError(
+                "Prithvi dependencies are missing. Install the project's "
+                "compatible PyTorch, MMCV and MMSegmentation versions."
+            ) from exc
 
         if not CONFIG_PATH.exists():
             raise FileNotFoundError(str(CONFIG_PATH))
@@ -917,6 +738,8 @@ class FloodApp:
 
         self.pipeline = Compose(pipeline_config)
         self.model = model
+        self.torch = torch
+        self.collate_fn = collate
         self.model.eval()
 
     def predict(self, path):
@@ -927,7 +750,7 @@ class FloodApp:
                 "img_info": {"filename": model_path}
             })
 
-            batch = collate(
+            batch = self.collate_fn(
                 [data],
                 samples_per_gpu=1
             )
@@ -935,15 +758,27 @@ class FloodApp:
             image = batch["img"][0]
             image_metas = batch["img_metas"].data[0][0]
 
-            with torch.no_grad():
+            with self.torch.no_grad():
                 output = self.model.inference(
                     image,
                     image_metas,
                     rescale=True
                 )
 
+            if not self.torch.is_tensor(output) or output.ndim != 4:
+                raise RuntimeError(
+                    "Unexpected Prithvi inference output. Expected a 4-D "
+                    "(batch, classes, height, width) logits tensor."
+                )
+            if output.shape[0] != 1 or output.shape[1] < 2:
+                raise RuntimeError(
+                    f"Expected one sample and at least two classes; got {tuple(output.shape)}."
+                )
+            # MMSegmentation inference returns class logits. Convert them to
+            # class probabilities before applying the 0.05–0.95 threshold.
+            probabilities = self.torch.softmax(output, dim=1)
             scores = (
-                output[0, 1]
+                probabilities[0, 1]
                 .detach()
                 .cpu()
                 .numpy()
@@ -955,6 +790,10 @@ class FloodApp:
                     "Prediction and image dimensions do not match."
                 )
 
+            if not np.all(np.isfinite(scores[valid_mask])):
+                raise RuntimeError("Model produced non-finite probabilities for valid pixels.")
+            if np.any(scores[valid_mask] < 0.0) or np.any(scores[valid_mask] > 1.0):
+                raise RuntimeError("Model probabilities are outside the expected [0, 1] range.")
             scores[~valid_mask] = -1.0
 
             return scores, valid_mask
@@ -982,9 +821,17 @@ class FloodApp:
             return
 
         self.busy = True
+        self.probability = None
+        self.valid_mask = None
+        self.flood_map = None
+        self.clear_insights()
+        for metric in self.metric_values:
+            metric.config(text="—")
+        self.view_limits.clear()
+        self.draw_results(reset=True)
         self.run_button.config(state="disabled")
         self.progress.start(12)
-        self.status.set("Starting model analysis...")
+        self.status.set("Analyzing... Loading Prithvi 100M on CPU.")
 
         threading.Thread(
             target=self.worker,
@@ -1023,61 +870,51 @@ class FloodApp:
         try:
             while True:
                 task, payload = self.ui_queue.get_nowait()
-
-                if task == "status":
-                    self.status.set(payload)
-
-                elif task == "success":
-                    self.finish_success(*payload)
-
-                elif task == "error":
-                    self.finish_error(payload)
-
+                try:
+                    if task == "status":
+                        self.status.set(payload)
+                    elif task == "success":
+                        self.finish_success(*payload)
+                    elif task == "error":
+                        self.finish_error(payload)
+                except Exception as exc:
+                    self.busy = False
+                    self.progress.stop()
+                    self.run_button.config(state="normal")
+                    self.status.set(f"UI update failed · {str(exc)[:90]}")
+                    print("TERRAFLUX UI callback error:", traceback.format_exc())
         except queue.Empty:
             pass
-
-        self.root.after(
-            80,
-            self.process_ui_queue
-        )
+        if self.root.winfo_exists():
+            self.root.after(80, self.process_ui_queue)
 
     def finish_success(self, scores, valid, path):
+        # End the processing state before redrawing; otherwise the map renderer
+        # would leave its temporary "Analyzing" label over a completed result.
+        self.busy = False
+        self.progress.stop()
+        self.run_button.config(state="normal")
         self.probability = scores
         self.valid_mask = valid
 
         self.refresh_classification()
 
         try:
-            self.save_outputs(
-                path,
-                scores,
-                self.flood_map
-            )
-
-            self.status.set(
-                "Analysis complete. GeoTIFF outputs saved."
-            )
-
+            self.save_outputs(path, scores, self.flood_map)
+            self.status.set("Ready · Analysis completed successfully.")
         except Exception as exc:
-            self.status.set(
-                f"Analysis complete; saving failed: {exc}"
-            )
-
-        self.busy = False
-        self.progress.stop()
-        self.run_button.config(state="normal")
+            self.status.set(f"Analysis complete; saving failed: {exc}")
 
     def finish_error(self, error):
         self.busy = False
         self.progress.stop()
         self.run_button.config(state="normal")
 
-        self.status.set("Analysis failed.")
-
-        messagebox.showerror(
-            "Analysis error",
-            error
-        )
+        short_error = error.strip().splitlines()[-1] if error.strip() else "Unknown error"
+        self.status.set(f"Failed · {short_error[:100]}")
+        self.draw_results(reset=True)
+        print("TERRAFLUX analysis traceback:\n", error)
+        messagebox.showerror("Analysis failed", short_error)
 
     # ========================================================
     # SAVE GEOTIFF OUTPUTS
@@ -1131,6 +968,15 @@ class FloodApp:
                     1
                 )
 
+    def clear_insights(self):
+        if not hasattr(self, "insights_label"):
+            return
+        self.insight_area_value.config(text="Flooded Area\n—")
+        self.insight_section_value.config(text="Most Affected Section\n—")
+        self.insight_share_value.config(text="Flooded Share\n—")
+        if not self.insights_label.winfo_manager():
+            self.insights_label.pack(fill="x", pady=(7, 5))
+
     # ========================================================
     # CLASSIFICATION AND METRICS
     # ========================================================
@@ -1142,7 +988,7 @@ class FloodApp:
             text=f"{threshold * 100:.0f}%"
         )
 
-        if self.probability is not None:
+        if self.probability is not None and self.valid_mask is not None:
             self.refresh_classification()
 
     def refresh_classification(self):
@@ -1167,17 +1013,36 @@ class FloodApp:
             if valid_pixels else 0
         )
 
-        self.metric_values[0].config(
-            text=f"{flood_pixels:,} pixels"
-        )
-
-        self.metric_values[1].config(
-            text=f"{share:.2f}%"
-        )
-
-        self.metric_values[2].config(
-            text=f"{valid_pixels:,} pixels"
-        )
+        non_flooded = valid_pixels - flood_pixels
+        self.metric_values[0].config(text=f"{flood_pixels:,} px")
+        self.metric_values[1].config(text=f"{non_flooded:,} px")
+        self.metric_values[2].config(text=f"{valid_pixels:,} px")
+        self.metric_values[3].config(text=f"{share:.2f}%")
+        grid = []
+        h, w = self.flood_map.shape
+        for row in range(3):
+            for col in range(3):
+                y0, y1 = row * h // 3, (row + 1) * h // 3
+                x0, x1 = col * w // 3, (col + 1) * w // 3
+                region_valid = self.valid_mask[y0:y1, x0:x1]
+                region_flood = self.flood_map[y0:y1, x0:x1] == 1
+                grid.append((int(np.count_nonzero(region_flood & region_valid)), row + 1, col + 1))
+        area_km2 = self.calculate_flooded_area_km2()
+        area_text = f"≈ {area_km2:.2f} km²" if area_km2 is not None else "Unavailable"
+        if grid and flood_pixels:
+            peak = max(grid)
+            position_names = {
+                (1, 1): "Top Left", (1, 2): "Top Center", (1, 3): "Top Right",
+                (2, 1): "Middle Left", (2, 2): "Center Region", (2, 3): "Middle Right",
+                (3, 1): "Bottom Left", (3, 2): "Bottom Center", (3, 3): "Bottom Right"
+            }
+            section = position_names.get((peak[1], peak[2]), f"Row {peak[1]}, Column {peak[2]}")
+            self.insight_section_value.config(text=f"Most Affected Section\n{section}\n(3×3 grid · {peak[0]:,} px)")
+        else:
+            self.insight_section_value.config(text="Most Affected Section\nNo flooded pixels")
+        self.insights_label.pack_forget()
+        self.insight_area_value.config(text=f"Flooded Area\n{area_text}")
+        self.insight_share_value.config(text=f"Flooded Share\n{share:.2f}%")
 
         self.draw_results()
 
@@ -1186,12 +1051,12 @@ class FloodApp:
     # ========================================================
 
     def set_view_mode(self, mode):
-        if self.view_mode.get() == mode:
+        if mode not in ("Satellite", "Flood", "Comparison"):
             return
-
         self.view_mode.set(mode)
         self.update_tab_styles()
-        self.draw_results(reset=True)
+        self.draw_results(reset=False)
+
 
     def update_tab_styles(self):
         selected = self.view_mode.get()
@@ -1216,411 +1081,440 @@ class FloodApp:
     # MAP DRAWING
     # ========================================================
 
+
     def draw_results(self, reset=False):
-        if self.rgb is None:
+        if not self.figures or not self.axes_by_key:
             return
 
-        height, width = self.rgb.shape[:2]
+        h, w = self.rgb.shape[:2] if self.rgb is not None else (1, 1)
         mode = self.view_mode.get()
+        visible = (
+            ("satellite", "flood") if mode == "Comparison"
+            else (("satellite",) if mode == "Satellite" else ("flood",))
+        )
 
-        self.figure.clear()
-        self.axes = []
+        for key in ("satellite", "flood"):
+            fig = self.figures[key]
+            canvas = self.canvases[key]
+            ax = self.axes_by_key[key]
 
-        if mode == "Comparison":
-            # Equal panel dimensions and identical image extents.
-            ax_left = self.figure.add_axes(
-                [0.015, 0.025, 0.475, 0.91]
+            # Save this map's limits separately before clearing its contents.
+            old_xlim = ax.get_xlim()
+            old_ylim = ax.get_ylim()
+            had_custom_view = (
+                not reset
+                and self.rgb is not None
+                and (
+                    not np.allclose(old_xlim, (0, w))
+                    or not np.allclose(old_ylim, (h, 0))
+                )
             )
 
-            ax_right = self.figure.add_axes(
-                [0.510, 0.025, 0.475, 0.91]
-            )
-
-            for ax in (ax_left, ax_right):
-                ax.imshow(
-                    self.rgb,
-                    origin="upper",
-                    extent=(0, width, height, 0),
-                    interpolation="nearest"
-                )
-
-                ax.set_aspect("auto")
-                ax.set_anchor("N")
-
-            ax_left.set_title(
-                "ORIGINAL SATELLITE IMAGE",
-                color=TEXT,
-                fontsize=10,
-                pad=8
-            )
-
-            if self.flood_map is not None:
-                overlay = np.zeros(
-                    (height, width, 4),
-                    dtype=np.float32
-                )
-
-                overlay[self.flood_map == 1] = [
-                    1.0, 0.10, 0.02, 0.55
-                ]
-
-                ax_right.imshow(
-                    overlay,
-                    origin="upper",
-                    extent=(0, width, height, 0),
-                    interpolation="nearest"
-                )
-
-                ax_right.set_title(
-                    "MODEL FLOOD DETECTION",
-                    color=TEXT,
-                    fontsize=10,
-                    pad=8
-                )
-
-                ax_right.legend(
-                    handles=[
-                        Patch(
-                            facecolor="#FF2E0A",
-                            alpha=0.55,
-                            label="Model-classified flood"
-                        )
-                    ],
-                    loc="lower left",
-                    facecolor=PANEL,
-                    labelcolor="white",
-                    fontsize=8
-                )
-
-            else:
-                ax_right.set_title(
-                    "RUN ANALYSIS TO VIEW DETECTION",
-                    color=TEXT,
-                    fontsize=10,
-                    pad=8
-                )
-
-            self.axes = [ax_left, ax_right]
-            self.map_axes = ax_left
-
-        else:
-            ax = self.figure.add_axes(
-                [0.015, 0.025, 0.97, 0.91]
-            )
-
-            ax.imshow(
-                self.rgb,
-                origin="upper",
-                extent=(0, width, height, 0),
-                interpolation="nearest"
-            )
-
+            # Clear the existing Axes instead of deleting/recreating it.
+            # This keeps event routing and each map's identity stable.
+            ax.clear()
+            ax.set_facecolor("#050A12")
+            ax.set_position([0.005, 0.005, 0.99, 0.99])
             ax.set_aspect("auto")
-            ax.set_anchor("N")
+            ax.set_xticks([])
+            ax.set_yticks([])
 
-            if mode == "Satellite":
-                ax.set_title(
-                    "NATURAL COLOUR SATELLITE VIEW",
-                    color=TEXT,
-                    fontsize=10,
-                    pad=8
-                )
-
-            elif mode == "Flood":
-                ax.set_title(
-                    "MODEL FLOOD DETECTION",
-                    color=TEXT,
-                    fontsize=10,
-                    pad=8
-                )
-
-                if self.flood_map is not None:
-                    overlay = np.zeros(
-                        (height, width, 4),
-                        dtype=np.float32
+            if key == "satellite":
+                if self.rgb is None:
+                    ax.text(
+                        0.5, 0.5, "Choose a GeoTIFF to begin",
+                        color=MUTED, ha="center", va="center",
+                        transform=ax.transAxes
                     )
-
-                    overlay[self.flood_map == 1] = [
-                        1.0, 0.10, 0.02, 0.55
-                    ]
-
+                else:
                     ax.imshow(
-                        overlay,
+                        self.rgb,
                         origin="upper",
-                        extent=(0, width, height, 0),
-                        interpolation="nearest"
+                        extent=(0, w, h, 0),
+                        interpolation="bilinear",
+                        aspect="auto",
+                        zorder=1
                     )
-
+                    if self.busy:
+                        ax.text(
+                            0.5, 0.5, "Analyzing satellite data...",
+                            color=TEXT, ha="center", va="center",
+                            transform=ax.transAxes,
+                            bbox={
+                                "facecolor": PANEL,
+                                "alpha": 0.88,
+                                "edgecolor": GOLD,
+                                "pad": 6
+                            },
+                            zorder=10
+                        )
+            else:
+                if self.flood_map is None:
+                    msg = (
+                        "Choose a GeoTIFF to begin"
+                        if self.rgb is None
+                        else (
+                            "Analyzing..."
+                            if self.busy
+                            else "Run analysis to view flood detection"
+                        )
+                    )
+                    ax.text(
+                        0.5, 0.5, msg, color=MUTED,
+                        ha="center", va="center",
+                        transform=ax.transAxes
+                    )
+                else:
+                    rgba = np.zeros((h, w, 4), dtype=np.float32)
+                    rgba[self.flood_map == 0] = [0.02, 0.04, 0.08, 1.0]
+                    rgba[self.flood_map == 1] = [
+                        0.02, 0.42, 1.0,
+                        float(self.overlay_opacity.get())
+                    ]
+                    rgba[self.flood_map == 255] = [0, 0, 0, 0]
+                    ax.imshow(
+                        rgba,
+                        origin="upper",
+                        extent=(0, w, h, 0),
+                        interpolation="nearest",
+                        aspect="auto",
+                        zorder=1
+                    )
                     ax.legend(
                         handles=[
                             Patch(
-                                facecolor="#FF2E0A",
-                                alpha=0.55,
-                                label="Model-classified flood"
+                                facecolor="#0878FF",
+                                alpha=0.9,
+                                label="Flood Detected"
+                            ),
+                            Patch(
+                                facecolor="#050A12",
+                                label="Not Flooded"
                             )
                         ],
-                        loc="lower left",
+                        loc="lower right",
                         facecolor=PANEL,
-                        labelcolor="white"
+                        labelcolor=TEXT,
+                        fontsize=7
                     )
 
+            # Set image-coordinate bounds explicitly after imshow. This makes
+            # the raster occupy the complete map viewport rather than a small
+            # aspect-constrained patch in the upper part of the card.
+            if self.rgb is not None:
+                # Add scale-bar artists first, then restore exact map limits;
+                # otherwise Matplotlib's autoscaling can shrink the raster.
+                self.add_scale_bar(ax)
+
+                if had_custom_view:
+                    ax.set_xlim(old_xlim)
+                    ax.set_ylim(old_ylim)
                 else:
-                    ax.text(
-                        0.5,
-                        0.5,
-                        "Run analysis to view flood detection",
-                        color=MUTED,
-                        ha="center",
-                        va="center",
-                        transform=ax.transAxes
+                    ax.set_xlim(0, w)
+                    ax.set_ylim(h, 0)
+
+            fig.set_facecolor(PANEL)
+            canvas.draw_idle()
+
+            card = self.map_cards[key]
+            if len(visible) == 2:
+                card.grid(
+                    row=0,
+                    column=0 if key == "satellite" else 1,
+                    sticky="nsew",
+                    padx=(
+                        (0, 5) if key == "satellite"
+                        else (5, 0)
                     )
+                )
+            elif key in visible:
+                card.grid(
+                    row=0,
+                    column=0,
+                    columnspan=2,
+                    sticky="nsew",
+                    padx=0
+                )
+            else:
+                card.grid_remove()
 
-            self.axes = [ax]
-            self.map_axes = ax
+        self.axes = [self.axes_by_key[key] for key in visible]
+        self.map_axes = self.axes[0] if self.axes else None
 
-        for ax in self.axes:
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_facecolor("#0B141D")
+    def _raster_metadata(self):
+        if not self.input_path:
+            return None
+        with rasterio.open(self.input_path) as src:
+            return {
+                "crs": src.crs,
+                "transform": src.transform,
+                "bounds": src.bounds,
+                "width": src.width,
+                "height": src.height,
+                "resolution": src.res,
+            }
 
-        self.figure.set_facecolor(PANEL)
+    def _pixel_area_m2_by_row(self):
+        """Return per-row pixel area in m²; geographic CRS uses geodesic area."""
+        if not self.input_path:
+            return None
+        if getattr(self, "_row_area_cache", None) is not None:
+            return self._row_area_cache
+        with rasterio.open(self.input_path) as src:
+            if src.crs is None:
+                return None
+            transform = src.transform
+            crs = src.crs
+            if crs.is_projected:
+                try:
+                    factor = float(crs.linear_units_factor[1])
+                except Exception:
+                    factor = 1.0
+                self._row_area_cache = np.full(src.height, abs(transform.a * transform.e - transform.b * transform.d) * factor * factor, dtype=np.float64)
+                return self._row_area_cache
+            if crs.is_geographic:
+                try:
+                    from pyproj import CRS as PyCRS
+                    geod = PyCRS.from_user_input(crs).get_geod()
+                except Exception:
+                    return None
+                areas = np.zeros(src.height, dtype=np.float64)
+                col = src.width // 2
+                for row in range(src.height):
+                    corners = [
+                        transform * (col, row),
+                        transform * (col + 1, row),
+                        transform * (col + 1, row + 1),
+                        transform * (col, row + 1),
+                    ]
+                    lons = [pt[0] for pt in corners]
+                    lats = [pt[1] for pt in corners]
+                    area, _ = geod.polygon_area_perimeter(lons, lats)
+                    areas[row] = abs(area)
+                self._row_area_cache = areas
+                return self._row_area_cache
+        return None
 
-        self.figure_canvas.draw()
+    def calculate_flooded_area_km2(self):
+        if self.flood_map is None or self.valid_mask is None:
+            return None
+        row_areas = self._pixel_area_m2_by_row()
+        if row_areas is None:
+            return None
+        flooded_by_row = np.count_nonzero(self.flood_map == 1, axis=1)
+        return float(np.sum(flooded_by_row * row_areas) / 1_000_000.0)
 
-        if reset:
-            self.fit_map()
-        else:
-            self.sync_comparison_limits()
+    def pixel_latlon(self, row, col):
+        raster_transform = getattr(self, "_raster_transform", None)
+        coordinate_transformer = getattr(self, "_coordinate_transformer", None)
+        if raster_transform is None or coordinate_transformer is None:
+            return None
+        try:
+            from rasterio.transform import xy
+            x, y = xy(raster_transform, row, col, offset="center")
+            lon, lat = coordinate_transformer.transform(x, y)
+            return float(lat), float(lon)
+        except Exception:
+            return None
+
+    def add_scale_bar(self, ax):
+        """Draw a ground-distance scale bar using raster CRS units."""
+        if not self.input_path or self.rgb is None:
+            return
+        try:
+            with rasterio.open(self.input_path) as src:
+                if src.crs is None:
+                    return
+                row = src.height // 2
+                col = src.width // 2
+                if src.crs.is_projected:
+                    try:
+                        unit_factor = float(src.crs.linear_units_factor[1])
+                    except Exception:
+                        unit_factor = 1.0
+                    metres_per_pixel = float(np.hypot(src.transform.a, src.transform.d)) * unit_factor
+                elif src.crs.is_geographic:
+                    from pyproj import CRS as PyCRS
+                    geod = PyCRS.from_user_input(src.crs).get_geod()
+                    p1 = src.transform * (col, row)
+                    p2 = src.transform * (col + 1, row)
+                    metres_per_pixel = abs(geod.inv(p1[0], p1[1], p2[0], p2[1])[2])
+                else:
+                    return
+                if not np.isfinite(metres_per_pixel) or metres_per_pixel <= 0:
+                    return
+                target_m = 2000.0
+                pixels = target_m / metres_per_pixel
+                if pixels > src.width * 0.30:
+                    target_m = 1000.0
+                    pixels = target_m / metres_per_pixel
+                if pixels > src.width * 0.30:
+                    target_m = 500.0
+                    pixels = target_m / metres_per_pixel
+                if pixels <= 0 or pixels > src.width * 0.45:
+                    return
+                x0 = src.width * 0.04
+                x1 = x0 + pixels
+                y = src.height * 0.94
+                ax.plot([x0, x1], [y, y], color="white", linewidth=3, solid_capstyle="butt", zorder=20)
+                ax.plot([x0, x0], [y - src.height * 0.008, y + src.height * 0.008], color="white", linewidth=1.2, zorder=20)
+                ax.plot([x1, x1], [y - src.height * 0.008, y + src.height * 0.008], color="white", linewidth=1.2, zorder=20)
+                label = f"{target_m / 1000:g} km" if target_m >= 1000 else f"{target_m:g} m"
+                ax.text(x0, y - src.height * 0.025, label, color="white", fontsize=7, ha="left", va="bottom", zorder=21, bbox={"facecolor":"#080D13", "alpha":0.65, "edgecolor":"none", "pad":1})
+        except Exception:
+            return
 
     # ========================================================
     # LINKED ZOOM AND PAN
     # ========================================================
 
     def sync_comparison_limits(self):
-        if (
-            self.view_mode.get() != "Comparison"
-            or len(self.axes) != 2
-        ):
+        # Comparison maps intentionally keep independent view limits.
+        return
+
+    def update_overlay_opacity(self, value):
+        self.opacity_label.config(text=f"{float(value) * 100:.0f}%")
+        if self.rgb is not None:
+            self.draw_results()
+
+    def control_zoom(self, map_key, factor):
+        ax = self.axes_by_key.get(map_key)
+        if ax is None or self.rgb is None:
             return
+        if factor == 0:
+            self.fit_map(ax=ax)
+        else:
+            xlim, ylim = ax.get_xlim(), ax.get_ylim()
+            self.zoom_at(sum(xlim)/2, sum(ylim)/2, factor, ax=ax)
 
-        xlim = self.map_axes.get_xlim()
-        ylim = self.map_axes.get_ylim()
 
-        for ax in self.axes:
-            if ax is not self.map_axes:
-                ax.set_xlim(xlim)
-                ax.set_ylim(ylim)
-
-        self.figure_canvas.draw_idle()
-
-    def fit_map(self):
+    def fit_map(self, ax=None):
         if self.rgb is None:
             return
+        h, w = self.rgb.shape[:2]
+        targets = [ax] if ax is not None else [self.axes_by_key[k] for k in ("satellite", "flood")]
+        for target in targets:
+            if target is not None:
+                target.set_xlim(0, w); target.set_ylim(h, 0)
+                target.figure.canvas.draw_idle()
 
-        height, width = self.rgb.shape[:2]
 
-        for ax in self.axes:
-            ax.set_xlim(0, width)
-            ax.set_ylim(height, 0)
-
-        self.figure_canvas.draw_idle()
-
-    def zoom_at(self, x, y, factor):
-        if self.map_axes is None or self.rgb is None:
+    def zoom_at(self, x, y, factor, ax=None):
+        if self.rgb is None:
             return
+        ax = ax or self.map_axes
+        if ax is None:
+            return
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        span_x, span_y = abs(xlim[1]-xlim[0]), abs(ylim[1]-ylim[0])
+        new_w = min(max(span_x / factor, 20), self.rgb.shape[1])
+        new_h = min(max(span_y / factor, 20), self.rgb.shape[0])
+        fx = (x-xlim[0])/(xlim[1]-xlim[0]) if xlim[1] != xlim[0] else .5
+        fy = (y-ylim[0])/(ylim[1]-ylim[0]) if ylim[1] != ylim[0] else .5
+        left, top = x-fx*new_w, y-fy*new_h
+        ax.set_xlim(left, left+new_w); ax.set_ylim(top, top+new_h)
+        ax.figure.canvas.draw_idle()
 
-        ax = self.map_axes
-
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
-
-        new_width = min(
-            max(abs(xlim[1] - xlim[0]) / factor, 40),
-            self.rgb.shape[1]
-        )
-
-        new_height = min(
-            max(abs(ylim[1] - ylim[0]) / factor, 40),
-            self.rgb.shape[0]
-        )
-
-        fx = (x - xlim[0]) / (xlim[1] - xlim[0])
-        fy = (y - ylim[0]) / (ylim[1] - ylim[0])
-
-        left = x - fx * new_width
-        top = y - fy * new_height
-
-        ax.set_xlim(left, left + new_width)
-        ax.set_ylim(top, top + new_height)
-
-        self.sync_comparison_limits()
-        self.figure_canvas.draw_idle()
 
     def on_map_scroll(self, event):
-        if event.inaxes not in self.axes:
+        if event.inaxes not in self.axes or event.xdata is None or event.ydata is None:
             return
+        factor = 1.15 if event.button == "up" else 1/1.15
+        self.zoom_at(event.xdata, event.ydata, factor, ax=event.inaxes)
 
-        if event.xdata is None or event.ydata is None:
-            return
-
-        self.map_axes = event.inaxes
-
-        factor = (
-            1.15 if event.button == "up"
-            else 1 / 1.15
-        )
-
-        self.zoom_at(
-            event.xdata,
-            event.ydata,
-            factor
-        )
 
     def on_map_press(self, event):
-        if event.inaxes not in self.axes:
+        if event.inaxes not in self.axes or event.button != 1:
             return
-
-        if event.button != 1:
-            return
-
         if event.dblclick:
-            self.fit_map()
+            self.fit_map(ax=event.inaxes)
             self.drag_data = None
             return
-
         self.map_axes = event.inaxes
+        self.drag_data = {"x": event.x, "y": event.y,
+            "xlim": event.inaxes.get_xlim(), "ylim": event.inaxes.get_ylim(),
+            "ax": event.inaxes, "moved": False}
 
-        self.drag_data = {
-            "x": event.x,
-            "y": event.y,
-            "xlim": event.inaxes.get_xlim(),
-            "ylim": event.inaxes.get_ylim(),
-            "moved": False
-        }
+
+    def on_map_motion(self, event):
+        if self.drag_data is not None or event.inaxes not in self.axes:
+            return
+        if event.xdata is None or event.ydata is None or self.input_path is None:
+            return
+        col, row = int(event.xdata), int(event.ydata)
+        if self.rgb is None or not (0 <= row < self.rgb.shape[0] and 0 <= col < self.rgb.shape[1]):
+            return
+        latlon = self.pixel_latlon(row, col)
+        if latlon:
+            self.status.set(f"Lat: {latlon[0]:.5f}°, Lon: {latlon[1]:.5f}° | Row {row}, Col {col}")
+
 
     def on_pan_move(self, event):
-        if self.drag_data is None:
+        if self.drag_data is None or event.x is None or event.y is None:
             return
+        d = self.drag_data
+        dxs, dys = event.x-d["x"], event.y-d["y"]
+        if abs(dxs)+abs(dys) > 4: d["moved"] = True
+        if not d["moved"]: return
+        ax = d["ax"]; bbox = ax.get_window_extent()
+        if bbox.width <= 0 or bbox.height <= 0: return
+        dx = -dxs*(d["xlim"][1]-d["xlim"][0])/bbox.width
+        dy = dys*(d["ylim"][1]-d["ylim"][0])/bbox.height
+        ax.set_xlim(d["xlim"][0]+dx, d["xlim"][1]+dx)
+        ax.set_ylim(d["ylim"][0]+dy, d["ylim"][1]+dy)
+        ax.figure.canvas.draw_idle()
 
-        if event.x is None or event.y is None:
-            return
-
-        data = self.drag_data
-
-        dx_screen = event.x - data["x"]
-        dy_screen = event.y - data["y"]
-
-        if abs(dx_screen) + abs(dy_screen) > 4:
-            data["moved"] = True
-
-        if not data["moved"]:
-            return
-
-        ax = self.map_axes
-        bbox = ax.get_window_extent()
-
-        if bbox.width <= 0 or bbox.height <= 0:
-            return
-
-        x_range = data["xlim"][1] - data["xlim"][0]
-        y_range = data["ylim"][1] - data["ylim"][0]
-
-        dx = -dx_screen * x_range / bbox.width
-        dy = dy_screen * y_range / bbox.height
-
-        ax.set_xlim(
-            data["xlim"][0] + dx,
-            data["xlim"][1] + dx
-        )
-
-        ax.set_ylim(
-            data["ylim"][0] + dy,
-            data["ylim"][1] + dy
-        )
-
-        self.sync_comparison_limits()
-        self.figure_canvas.draw_idle()
 
     def on_map_release(self, event):
         if self.drag_data is None:
             return
-
         was_drag = self.drag_data["moved"]
         self.drag_data = None
-
-        if was_drag or self.probability is None:
+        if was_drag or self.probability is None or event.inaxes not in self.axes:
             return
+        if event.xdata is None or event.ydata is None: return
+        col, row = int(event.xdata), int(event.ydata)
+        h, w = self.probability.shape
+        if not (0 <= col < w and 0 <= row < h): return
+        if not self.valid_mask[row, col]:
+            self.status.set("Selected pixel has no valid data."); return
+        score = float(self.probability[row, col])
+        label = "Flood-classified" if self.flood_map[row, col] == 1 else "Not classified as flood"
+        latlon = self.pixel_latlon(row, col)
+        coord = f" | Lat {latlon[0]:.5f}, Lon {latlon[1]:.5f}" if latlon else ""
+        self.status.set(f"Row {row}, Col {col} | Model score: {score*100:.1f}% | {label}{coord}")
 
-        if event.inaxes not in self.axes:
-            return
-
-        if event.xdata is None or event.ydata is None:
-            return
-
-        x = int(event.xdata)
-        y = int(event.ydata)
-
-        height, width = self.probability.shape
-
-        if not (0 <= x < width and 0 <= y < height):
-            return
-
-        if not self.valid_mask[y, x]:
-            self.status.set(
-                "Selected pixel has no valid data."
-            )
-            return
-
-        score = float(self.probability[y, x])
-
-        label = (
-            "Flood-classified"
-            if score >= float(self.threshold.get())
-            else "Not classified as flood"
-        )
-
-        self.status.set(
-            f"Pixel row {y}, column {x} | "
-            f"Model score: {score * 100:.1f}% | {label}"
-        )
-
-    # ========================================================
-    # EXPORT
-    # ========================================================
 
     def export_png(self):
         if self.rgb is None:
-            messagebox.showinfo(
-                "No image",
-                "Load an image first."
-            )
-            return
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG image", "*.png")]
-        )
-
-        if not path:
-            return
-
+            messagebox.showinfo("No image", "Load an image first."); return
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG image", "*.png")])
+        if not path: return
         try:
-            self.figure.savefig(
-                path,
-                dpi=180,
-                facecolor=PANEL,
-                bbox_inches="tight"
-            )
-
-            self.status.set(
-                "PNG exported successfully."
-            )
-
+            keys = ("satellite", "flood") if self.view_mode.get() == "Comparison" else (("satellite",) if self.view_mode.get() == "Satellite" else ("flood",))
+            export_fig = Figure(figsize=(12 if len(keys)==2 else 7, 5), dpi=160, facecolor=BG)
+            for i, key in enumerate(keys):
+                ax = export_fig.add_subplot(1, len(keys), i+1)
+                source_ax = self.axes_by_key[key]
+                ax.set_xlim(source_ax.get_xlim()); ax.set_ylim(source_ax.get_ylim())
+                if key == "satellite":
+                    ax.imshow(self.rgb, origin="upper", extent=(0,self.rgb.shape[1],self.rgb.shape[0],0))
+                    ax.set_title("Original Satellite Image", color=TEXT)
+                elif self.flood_map is None:
+                    ax.text(.5,.5,"No flood prediction available",ha="center",va="center",color=TEXT,transform=ax.transAxes)
+                    ax.set_title("Model Flood Detection", color=TEXT)
+                else:
+                    rgba=np.zeros((*self.flood_map.shape,4),dtype=np.float32)
+                    rgba[self.flood_map==0]=[.02,.04,.08,1]
+                    rgba[self.flood_map==1]=[.02,.42,1,float(self.overlay_opacity.get())]
+                    ax.imshow(rgba,origin="upper",extent=(0,self.rgb.shape[1],self.rgb.shape[0],0))
+                    ax.set_title("Model Flood Detection", color=TEXT)
+                ax.set_xticks([]); ax.set_yticks([])
+            export_fig.savefig(path, dpi=160, facecolor=BG, bbox_inches="tight")
+            self.status.set("PNG exported successfully.")
         except Exception as exc:
-            messagebox.showerror(
-                "Export error",
-                str(exc)
-            )
+            messagebox.showerror("Export error", str(exc))
+
 
     def export_csv(self):
         if self.probability is None:
@@ -1662,7 +1556,7 @@ class FloodApp:
                 writer = csv.writer(file)
 
                 writer.writerow([
-                    "AI Earth Guardian Flood Report"
+                    "TERRAFLUX Flood Intelligence Report"
                 ])
 
                 writer.writerow([
@@ -1690,15 +1584,18 @@ class FloodApp:
                     flood_pixels
                 ])
 
-                writer.writerow([
-                    "Valid pixels",
-                    valid_pixels
-                ])
-
-                writer.writerow([
-                    "Classified pixel share (%)",
-                    round(share, 3)
-                ])
+                writer.writerow(["Non-flooded pixels", valid_pixels - flood_pixels])
+                writer.writerow(["Valid pixels", valid_pixels])
+                writer.writerow(["Flooded share (%)", round(share, 3)])
+                area_km2 = self.calculate_flooded_area_km2()
+                writer.writerow(["Flooded area (km²)", round(area_km2, 6) if area_km2 is not None else "Unavailable"])
+                with rasterio.open(self.input_path) as src:
+                    writer.writerow(["CRS", str(src.crs)])
+                    writer.writerow(["Bounds", str(tuple(src.bounds))])
+                    writer.writerow(["Pixel resolution", str(src.res)])
+                    writer.writerow(["Raster width", src.width])
+                    writer.writerow(["Raster height", src.height])
+                    writer.writerow(["Band count", src.count])
 
                 writer.writerow([
                     "Interpretation",
@@ -1715,6 +1612,52 @@ class FloodApp:
                 str(exc)
             )
 
+
+
+    def reset_all(self):
+        if self.busy: return
+        self.threshold.set(DEFAULT_THRESHOLD); self.overlay_opacity.set(0.55)
+        self.threshold_label.config(text="30%"); self.opacity_label.config(text="55%")
+        self.view_mode.set("Comparison"); self.drag_data = None
+        self.update_tab_styles()
+        self.fit_map()
+        if self.probability is not None and self.valid_mask is not None:
+            self.refresh_classification()
+        else:
+            for metric in self.metric_values: metric.config(text="—")
+            self.draw_results(reset=True)
+        self.status.set("Ready · View and controls reset.")
+
+
+    def export_geotiff(self):
+        if self.flood_map is None or self.input_path is None:
+            messagebox.showinfo("No results", "Run flood analysis first.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".tif",
+            filetypes=[("GeoTIFF", "*.tif")],
+            initialfile=f"{Path(self.input_path).stem}_flood_map.tif"
+        )
+        if not path:
+            return
+        try:
+            with rasterio.open(self.input_path) as src:
+                profile = src.profile.copy()
+                profile.update(count=1, dtype="uint8", nodata=255, compress="lzw")
+                with rasterio.open(path, "w", **profile) as dst:
+                    dst.write(self.flood_map.astype(np.uint8), 1)
+                    dst.set_band_description(1, "Flood classification: 1=flood, 0=not flooded, 255=NoData")
+                    dst.update_tags(
+                        model="Prithvi 100M",
+                        device="CPU",
+                        threshold=str(float(self.threshold.get())),
+                        class_1="Flood detected",
+                        class_0="Not flooded",
+                        nodata_value="255",
+                    )
+            self.status.set("GeoTIFF exported successfully.")
+        except Exception as exc:
+            messagebox.showerror("GeoTIFF export error", str(exc))
 
 # ============================================================
 # START APPLICATION

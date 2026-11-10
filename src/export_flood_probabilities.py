@@ -55,8 +55,9 @@ for path in files:
     batch = collate([data], samples_per_gpu=1)
 
     # Match the verified working inference pipeline.
-    img = batch["img"][0]
-    img_metas = batch["img_metas"].data[0][0]
+       # Match the verified working inference pipeline.
+    img = batch["img"].data[0]
+    img_metas = batch["img_metas"].data[0]
 
     with torch.no_grad():
         probabilities = model.inference(
