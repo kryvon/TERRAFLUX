@@ -31,3 +31,14 @@ wheel_test/
 
 # Editor settings
 .vscode/
+
+# Local generated files
+.venv_prithvi39/
+TERRAFLUX_AUDIT.zip
+project_structure.txt
+flood_config.yaml
+AI_EARTH_GUARDIAN.code-workspace
+__pycache__/
+*.pyc
+
+gui_diff.txt

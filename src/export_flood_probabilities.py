@@ -54,10 +54,10 @@ for path in files:
     data = pipeline({"img_info": {"filename": path}})
     batch = collate([data], samples_per_gpu=1)
 
-    # Match the verified working inference pipeline.
-       # Match the verified working inference pipeline.
-    img = batch["img"].data[0]
-    img_metas = batch["img_metas"].data[0]
+    # With this MMCV pipeline, collate() keeps the image tensor in a
+    # one-element list, while metadata is wrapped in a DataContainer.
+    img = batch["img"][0]
+    img_metas = batch["img_metas"].data[0][0]
 
     with torch.no_grad():
         probabilities = model.inference(
@@ -74,19 +74,29 @@ for path in files:
                 f"Unexpected output shape: {tuple(probabilities.shape)}"
             )
 
+        # TemporalEncoderDecoder.inference() returns probabilities, not logits.
         flood_probability = probabilities[0, 1]
-        probability = (
-            flood_probability.cpu().numpy().astype(np.float32)
-        )
+        probability = flood_probability.detach().cpu().numpy().astype(np.float32)
 
     with rasterio.open(path) as src:
         profile = src.profile.copy()
+        valid_mask = np.all(src.read_masks(), axis=0) > 0
+        if src.nodata is not None:
+            raw = src.read()
+            valid_mask &= np.all(raw != src.nodata, axis=0)
+        valid_mask &= np.all(np.isfinite(src.read()), axis=0)
 
         if probability.shape != (src.height, src.width):
             raise RuntimeError(
                 f"{name}: probability shape {probability.shape} "
                 f"doesn't match input {(src.height, src.width)}"
             )
+
+        if not np.all(np.isfinite(probability[valid_mask])):
+            raise RuntimeError(f"{name}: non-finite probabilities on valid pixels")
+        if np.any((probability[valid_mask] < 0.0) | (probability[valid_mask] > 1.0)):
+            raise RuntimeError(f"{name}: probabilities outside [0, 1]")
+        probability[~valid_mask] = -1.0
 
         profile.update(
             count=1,
@@ -101,9 +111,9 @@ for path in files:
     print("Saved:", out_path)
     print(
         "Probability min/max/mean:",
-        round(float(probability.min()), 4),
-        round(float(probability.max()), 4),
-        round(float(probability.mean()), 4)
+        round(float(probability[valid_mask].min()), 4),
+        round(float(probability[valid_mask].max()), 4),
+        round(float(probability[valid_mask].mean()), 4)
     )
 
 print("\nDONE: probability maps exported.")

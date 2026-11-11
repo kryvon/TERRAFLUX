@@ -19,7 +19,7 @@ if len(maps) != 5:
     raise RuntimeError(f"Expected 5 maps, found {len(maps)}")
 
 error_cmap = ListedColormap([
-    "#777777",  # True Negative
+   "#555555",  # True Negative
     "#16803c",  # True Positive
     "#e53935",  # False Positive
     "#facc15"   # False Negative
@@ -109,6 +109,7 @@ fig.legend(
         plt.Line2D([0], [0], color="white", lw=6, marker="s",
                    markeredgecolor="black", label="Flood"),
         plt.Line2D([0], [0], color="grey", lw=6, label="NoData"),
+        plt.Line2D([0], [0], color="#555555", lw=6, label="True Negative"),
         plt.Line2D([0], [0], color="#16803c", lw=6, label="True Positive"),
         plt.Line2D([0], [0], color="#e53935", lw=6, label="False Positive"),
         plt.Line2D([0], [0], color="#facc15", lw=6, label="False Negative"),
